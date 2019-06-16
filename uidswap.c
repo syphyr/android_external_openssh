@@ -1,4 +1,4 @@
-/* $OpenBSD: uidswap.c,v 1.39 2015/06/24 01:49:19 dtucker Exp $ */
+/* $OpenBSD: uidswap.c,v 1.41 2018/07/18 11:34:04 dtucker Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -59,6 +59,7 @@ static gid_t	saved_egid = 0;
 /* Saved effective uid. */
 static int	privileged = 0;
 static int	temporarily_use_uid_effective = 0;
+static uid_t	user_groups_uid;
 static gid_t	*saved_egroups = NULL, *user_groups = NULL;
 static int	saved_egroupslen = -1, user_groupslen = -1;
 
@@ -102,10 +103,11 @@ temporarily_use_uid(struct passwd *pw)
 			fatal("getgroups: %.100s", strerror(errno));
 	} else { /* saved_egroupslen == 0 */
 		free(saved_egroups);
+		saved_egroups = NULL;
 	}
 
 	/* set and save the user's groups */
-	if (user_groupslen == -1) {
+	if (user_groupslen == -1 || user_groups_uid != pw->pw_uid) {
 		if (initgroups(pw->pw_name, pw->pw_gid) < 0)
 			fatal("initgroups: %s: %.100s", pw->pw_name,
 			    strerror(errno));
@@ -120,7 +122,9 @@ temporarily_use_uid(struct passwd *pw)
 				fatal("getgroups: %.100s", strerror(errno));
 		} else { /* user_groupslen == 0 */
 			free(user_groups);
+			user_groups = NULL;
 		}
+		user_groups_uid = pw->pw_uid;
 	}
 	/* Set the effective uid to the given (unprivileged) uid. */
 	if (setgroups(user_groupslen, user_groups) < 0)
@@ -139,31 +143,6 @@ temporarily_use_uid(struct passwd *pw)
 	if (seteuid(pw->pw_uid) == -1)
 		fatal("seteuid %u: %.100s", (u_int)pw->pw_uid,
 		    strerror(errno));
-}
-
-void
-permanently_drop_suid(uid_t uid)
-{
-#ifndef HAVE_CYGWIN
-	uid_t old_uid = getuid();
-#endif
-
-	debug("permanently_drop_suid: %u", (u_int)uid);
-	if (setresuid(uid, uid, uid) < 0)
-		fatal("setresuid %u: %.100s", (u_int)uid, strerror(errno));
-
-#ifndef HAVE_CYGWIN
-	/* Try restoration of UID if changed (test clearing of saved uid) */
-	if (old_uid != uid &&
-	    (setuid(old_uid) != -1 || seteuid(old_uid) != -1))
-		fatal("%s: was able to restore old [e]uid", __func__);
-#endif
-
-	/* Verify UID drop was successful */
-	if (getuid() != uid || geteuid() != uid) {
-		fatal("%s: euid incorrect uid:%u euid:%u (should be %u)",
-		    __func__, (u_int)getuid(), (u_int)geteuid(), (u_int)uid);
-	}
 }
 
 /*
@@ -209,7 +188,7 @@ restore_uid(void)
 void
 permanently_set_uid(struct passwd *pw)
 {
-#ifndef HAVE_CYGWIN
+#ifndef NO_UID_RESTORATION_TEST
 	uid_t old_uid = getuid();
 	gid_t old_gid = getgid();
 #endif
@@ -261,7 +240,7 @@ permanently_set_uid(struct passwd *pw)
 	if (setresuid(pw->pw_uid, pw->pw_uid, pw->pw_uid) < 0)
 		fatal("setresuid %u: %.100s", (u_int)pw->pw_uid, strerror(errno));
 
-#ifndef HAVE_CYGWIN
+#ifndef NO_UID_RESTORATION_TEST
 	/* Try restoration of GID if changed (test clearing of saved gid) */
 	if (old_gid != pw->pw_gid && pw->pw_uid != 0 &&
 	    (setgid(old_gid) != -1 || setegid(old_gid) != -1))
@@ -275,7 +254,7 @@ permanently_set_uid(struct passwd *pw)
 		    (u_int)pw->pw_gid);
 	}
 
-#ifndef HAVE_CYGWIN
+#ifndef NO_UID_RESTORATION_TEST
 	/* Try restoration of UID if changed (test clearing of saved uid) */
 	if (old_uid != pw->pw_uid &&
 	    (setuid(old_uid) != -1 || seteuid(old_uid) != -1))

@@ -1,4 +1,4 @@
-/* $OpenBSD: sftp-client.c,v 1.120 2015/05/28 04:50:53 djm Exp $ */
+/* $OpenBSD: sftp-client.c,v 1.133 2019/01/24 16:52:17 dtucker Exp $ */
 /*
  * Copyright (c) 2001-2004 Damien Miller <djm@openbsd.org>
  *
@@ -22,7 +22,6 @@
 
 #include "includes.h"
 
-#include <sys/param.h>	/* MIN MAX */
 #include <sys/types.h>
 #ifdef HAVE_SYS_STATVFS_H
 #include <sys/statvfs.h>
@@ -53,6 +52,7 @@
 #include "atomicio.h"
 #include "progressmeter.h"
 #include "misc.h"
+#include "utf8.h"
 
 #include "sftp.h"
 #include "sftp-common.h"
@@ -67,6 +67,13 @@ extern int showprogress;
 /* Maximum depth to descend in directory trees */
 #define MAX_DIR_DEPTH 64
 
+/* Directory separator characters */
+#ifdef HAVE_CYGWIN
+# define SFTP_DIRECTORY_CHARS      "/\\"
+#else /* HAVE_CYGWIN */
+# define SFTP_DIRECTORY_CHARS      "/"
+#endif /* HAVE_CYGWIN */
+
 struct sftp_conn {
 	int fd_in;
 	int fd_out;
@@ -79,6 +86,7 @@ struct sftp_conn {
 #define SFTP_EXT_FSTATVFS	0x00000004
 #define SFTP_EXT_HARDLINK	0x00000008
 #define SFTP_EXT_FSYNC		0x00000010
+#define SFTP_EXT_LSETSTAT	0x00000020
 	u_int exts;
 	u_int64_t limit_kbps;
 	struct bwlimit bwlimit_in, bwlimit_out;
@@ -94,7 +102,9 @@ sftpio(void *_bwlimit, size_t amount)
 {
 	struct bwlimit *bwlimit = (struct bwlimit *)_bwlimit;
 
-	bandwidth_limit(bwlimit, amount);
+	refresh_progress_meter(0);
+	if (bwlimit != NULL)
+		bandwidth_limit(bwlimit, amount);
 	return 0;
 }
 
@@ -114,8 +124,8 @@ send_msg(struct sftp_conn *conn, struct sshbuf *m)
 	iov[1].iov_base = (u_char *)sshbuf_ptr(m);
 	iov[1].iov_len = sshbuf_len(m);
 
-	if (atomiciov6(writev, conn->fd_out, iov, 2,
-	    conn->limit_kbps > 0 ? sftpio : NULL, &conn->bwlimit_out) !=
+	if (atomiciov6(writev, conn->fd_out, iov, 2, sftpio,
+	    conn->limit_kbps > 0 ? &conn->bwlimit_out : NULL) !=
 	    sshbuf_len(m) + sizeof(mlen))
 		fatal("Couldn't send packet: %s", strerror(errno));
 
@@ -123,7 +133,7 @@ send_msg(struct sftp_conn *conn, struct sshbuf *m)
 }
 
 static void
-get_msg(struct sftp_conn *conn, struct sshbuf *m)
+get_msg_extended(struct sftp_conn *conn, struct sshbuf *m, int initial)
 {
 	u_int msg_len;
 	u_char *p;
@@ -131,9 +141,9 @@ get_msg(struct sftp_conn *conn, struct sshbuf *m)
 
 	if ((r = sshbuf_reserve(m, 4, &p)) != 0)
 		fatal("%s: buffer error: %s", __func__, ssh_err(r));
-	if (atomicio6(read, conn->fd_in, p, 4,
-	    conn->limit_kbps > 0 ? sftpio : NULL, &conn->bwlimit_in) != 4) {
-		if (errno == EPIPE)
+	if (atomicio6(read, conn->fd_in, p, 4, sftpio,
+	    conn->limit_kbps > 0 ? &conn->bwlimit_in : NULL) != 4) {
+		if (errno == EPIPE || errno == ECONNRESET)
 			fatal("Connection closed");
 		else
 			fatal("Couldn't read packet: %s", strerror(errno));
@@ -141,19 +151,29 @@ get_msg(struct sftp_conn *conn, struct sshbuf *m)
 
 	if ((r = sshbuf_get_u32(m, &msg_len)) != 0)
 		fatal("%s: buffer error: %s", __func__, ssh_err(r));
-	if (msg_len > SFTP_MAX_MSG_LENGTH)
-		fatal("Received message too long %u", msg_len);
+	if (msg_len > SFTP_MAX_MSG_LENGTH) {
+		do_log2(initial ? SYSLOG_LEVEL_ERROR : SYSLOG_LEVEL_FATAL,
+		    "Received message too long %u", msg_len);
+		fatal("Ensure the remote shell produces no output "
+		    "for non-interactive sessions.");
+	}
 
 	if ((r = sshbuf_reserve(m, msg_len, &p)) != 0)
 		fatal("%s: buffer error: %s", __func__, ssh_err(r));
-	if (atomicio6(read, conn->fd_in, p, msg_len,
-	    conn->limit_kbps > 0 ? sftpio : NULL, &conn->bwlimit_in)
+	if (atomicio6(read, conn->fd_in, p, msg_len, sftpio,
+	    conn->limit_kbps > 0 ? &conn->bwlimit_in : NULL)
 	    != msg_len) {
 		if (errno == EPIPE)
 			fatal("Connection closed");
 		else
 			fatal("Read packet: %s", strerror(errno));
 	}
+}
+
+static void
+get_msg(struct sftp_conn *conn, struct sshbuf *m)
+{
+	get_msg_extended(conn, m, 0);
 }
 
 static void
@@ -399,7 +419,7 @@ do_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 
 	sshbuf_reset(msg);
 
-	get_msg(ret, msg);
+	get_msg_extended(ret, msg, 1);
 
 	/* Expecting a VERSION reply */
 	if ((r = sshbuf_get_u8(msg, &type)) != 0)
@@ -446,6 +466,10 @@ do_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 		    strcmp((char *)value, "1") == 0) {
 			ret->exts |= SFTP_EXT_FSYNC;
 			known = 1;
+		} else if (strcmp(name, "lsetstat@openssh.com") == 0 &&
+		    strcmp((char *)value, "1") == 0) {
+			ret->exts |= SFTP_EXT_LSETSTAT;
+			known = 1;
 		}
 		if (known) {
 			debug2("Server supports extension \"%s\" revision %s",
@@ -461,7 +485,7 @@ do_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 
 	/* Some filexfer v.0 servers don't support large packets */
 	if (ret->version == 0)
-		ret->transfer_buflen = MIN(ret->transfer_buflen, 20480);
+		ret->transfer_buflen = MINIMUM(ret->transfer_buflen, 20480);
 
 	ret->limit_kbps = limit_kbps;
 	if (ret->limit_kbps > 0) {
@@ -515,8 +539,7 @@ do_lsreaddir(struct sftp_conn *conn, const char *path, int print_flag,
 	struct sshbuf *msg;
 	u_int count, id, i, expected_id, ents = 0;
 	size_t handle_len;
-	u_char type;
-	char *handle;
+	u_char type, *handle;
 	int status = SSH2_FX_FAILURE;
 	int r;
 
@@ -588,6 +611,8 @@ do_lsreaddir(struct sftp_conn *conn, const char *path, int print_flag,
 
 		if ((r = sshbuf_get_u32(msg, &count)) != 0)
 			fatal("%s: buffer error: %s", __func__, ssh_err(r));
+		if (count > SSHBUF_SIZE_MAX)
+			fatal("%s: nonsensical number of entries", __func__);
 		if (count == 0)
 			break;
 		debug3("Received %d SSH2_FXP_NAME responses", count);
@@ -611,14 +636,14 @@ do_lsreaddir(struct sftp_conn *conn, const char *path, int print_flag,
 			}
 
 			if (print_flag)
-				printf("%s\n", longname);
+				mprintf("%s\n", longname);
 
 			/*
 			 * Directory entries should never contain '/'
 			 * These can be used to attack recursive ops
 			 * (e.g. send '../../../../etc/passwd')
 			 */
-			if (strchr(filename, '/') != NULL) {
+			if (strpbrk(filename, SFTP_DIRECTORY_CHARS) != NULL) {
 				error("Server sent suspect path \"%s\" "
 				    "during readdir of \"%s\"", filename, path);
 			} else if (dir) {
@@ -651,7 +676,7 @@ do_lsreaddir(struct sftp_conn *conn, const char *path, int print_flag,
 		**dir = NULL;
 	}
 
-	return status;
+	return status == SSH2_FX_OK ? 0 : -1;
 }
 
 int
@@ -1001,7 +1026,7 @@ do_fsync(struct sftp_conn *conn, u_char *handle, u_int handle_len)
 	if (status != SSH2_FX_OK)
 		error("Couldn't sync file: %s", fx2txt(status));
 
-	return status;
+	return status == SSH2_FX_OK ? 0 : -1;
 }
 
 #ifdef notyet
@@ -1078,7 +1103,6 @@ do_statvfs(struct sftp_conn *conn, const char *path, struct sftp_statvfs *st,
 
 	if ((msg = sshbuf_new()) == NULL)
 		fatal("%s: sshbuf_new failed", __func__);
-	sshbuf_reset(msg);
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
 	    (r = sshbuf_put_cstring(msg, "statvfs@openssh.com")) != 0 ||
@@ -1107,7 +1131,6 @@ do_fstatvfs(struct sftp_conn *conn, const u_char *handle, u_int handle_len,
 
 	if ((msg = sshbuf_new()) == NULL)
 		fatal("%s: sshbuf_new failed", __func__);
-	sshbuf_reset(msg);
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
 	    (r = sshbuf_put_cstring(msg, "fstatvfs@openssh.com")) != 0 ||
@@ -1120,6 +1143,38 @@ do_fstatvfs(struct sftp_conn *conn, const u_char *handle, u_int handle_len,
 }
 #endif
 
+int
+do_lsetstat(struct sftp_conn *conn, const char *path, Attrib *a)
+{
+	struct sshbuf *msg;
+	u_int status, id;
+	int r;
+
+	if ((conn->exts & SFTP_EXT_LSETSTAT) == 0) {
+		error("Server does not support lsetstat@openssh.com extension");
+		return -1;
+	}
+
+	id = conn->msg_id++;
+	if ((msg = sshbuf_new()) == NULL)
+		fatal("%s: sshbuf_new failed", __func__);
+	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
+	    (r = sshbuf_put_u32(msg, id)) != 0 ||
+	    (r = sshbuf_put_cstring(msg, "lsetstat@openssh.com")) != 0 ||
+	    (r = sshbuf_put_cstring(msg, path)) != 0 ||
+	    (r = encode_attrib(msg, a)) != 0)
+		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+	send_msg(conn, msg);
+	sshbuf_free(msg);
+
+	status = get_status(conn, id);
+	if (status != SSH2_FX_OK)
+		error("Couldn't setstat on \"%s\": %s", path,
+		    fx2txt(status));
+
+	return status == SSH2_FX_OK ? 0 : -1;
+}
+
 static void
 send_read_request(struct sftp_conn *conn, u_int id, u_int64_t offset,
     u_int len, const u_char *handle, u_int handle_len)
@@ -1129,7 +1184,6 @@ send_read_request(struct sftp_conn *conn, u_int id, u_int64_t offset,
 
 	if ((msg = sshbuf_new()) == NULL)
 		fatal("%s: sshbuf_new failed", __func__);
-	sshbuf_reset(msg);
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_READ)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
 	    (r = sshbuf_put_string(msg, handle, handle_len)) != 0 ||
@@ -1351,7 +1405,7 @@ do_download(struct sftp_conn *conn, const char *remote_path,
 				    req->offset, req->len, handle, handle_len);
 				/* Reduce the request size */
 				if (len < buflen)
-					buflen = MAX(MIN_READ_SIZE, len);
+					buflen = MAXIMUM(MIN_READ_SIZE, len);
 			}
 			if (max_req > 0) { /* max_req = 0 iff EOF received */
 				if (size > 0 && offset > size) {
@@ -1433,7 +1487,7 @@ do_download(struct sftp_conn *conn, const char *remote_path,
 	sshbuf_free(msg);
 	free(handle);
 
-	return(status);
+	return status == SSH2_FX_OK ? 0 : -1;
 }
 
 static int
@@ -1443,7 +1497,7 @@ download_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 {
 	int i, ret = 0;
 	SFTP_DIRENT **dir_entries;
-	char *filename, *new_src, *new_dst;
+	char *filename, *new_src = NULL, *new_dst = NULL;
 	mode_t mode = 0777;
 
 	if (depth >= MAX_DIR_DEPTH) {
@@ -1461,7 +1515,7 @@ download_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 		return -1;
 	}
 	if (print_flag)
-		printf("Retrieving %s\n", src);
+		mprintf("Retrieving %s\n", src);
 
 	if (dirattrib->flags & SSH2_FILEXFER_ATTR_PERMISSIONS)
 		mode = dirattrib->perm & 01777;
@@ -1481,8 +1535,10 @@ download_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 	}
 
 	for (i = 0; dir_entries[i] != NULL && !interrupted; i++) {
-		filename = dir_entries[i]->filename;
+		free(new_dst);
+		free(new_src);
 
+		filename = dir_entries[i]->filename;
 		new_dst = path_append(dst, filename);
 		new_src = path_append(src, filename);
 
@@ -1505,9 +1561,9 @@ download_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 		} else
 			logit("%s: not a regular file\n", new_src);
 
-		free(new_dst);
-		free(new_src);
 	}
+	free(new_dst);
+	free(new_src);
 
 	if (preserve_flag) {
 		if (dirattrib->flags & SSH2_FILEXFER_ATTR_ACMODTIME) {
@@ -1601,7 +1657,7 @@ do_upload(struct sftp_conn *conn, const char *local_path,
 	if (resume) {
 		/* Get remote file size if it exists */
 		if ((c = do_stat(conn, remote_path, 0)) == NULL) {
-			close(local_fd);                
+			close(local_fd);
 			return -1;
 		}
 
@@ -1760,7 +1816,7 @@ do_upload(struct sftp_conn *conn, const char *local_path,
 	if (fsync_flag)
 		(void)do_fsync(conn, handle, handle_len);
 
-	if (do_close(conn, handle, handle_len) != SSH2_FX_OK)
+	if (do_close(conn, handle, handle_len) != 0)
 		status = SSH2_FX_FAILURE;
 
 	free(handle);
@@ -1773,12 +1829,11 @@ upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
     int depth, int preserve_flag, int print_flag, int resume, int fsync_flag)
 {
 	int ret = 0;
-	u_int status;
 	DIR *dirp;
 	struct dirent *dp;
-	char *filename, *new_src, *new_dst;
+	char *filename, *new_src = NULL, *new_dst = NULL;
 	struct stat sb;
-	Attrib a;
+	Attrib a, *dirattrib;
 
 	if (depth >= MAX_DIR_DEPTH) {
 		error("Maximum directory depth exceeded: %d levels", depth);
@@ -1795,7 +1850,7 @@ upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 		return -1;
 	}
 	if (print_flag)
-		printf("Entering %s\n", src);
+		mprintf("Entering %s\n", src);
 
 	attrib_clear(&a);
 	stat_to_attrib(&sb, &a);
@@ -1805,17 +1860,18 @@ upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 	if (!preserve_flag)
 		a.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
 
-	status = do_mkdir(conn, dst, &a, 0);
 	/*
-	 * we lack a portable status for errno EEXIST,
-	 * so if we get a SSH2_FX_FAILURE back we must check
-	 * if it was created successfully.
+	 * sftp lacks a portable status value to match errno EEXIST,
+	 * so if we get a failure back then we must check whether
+	 * the path already existed and is a directory.
 	 */
-	if (status != SSH2_FX_OK) {
-		if (status != SSH2_FX_FAILURE)
+	if (do_mkdir(conn, dst, &a, 0) != 0) {
+		if ((dirattrib = do_stat(conn, dst, 0)) == NULL)
 			return -1;
-		if (do_stat(conn, dst, 0) == NULL)
+		if (!S_ISDIR(dirattrib->perm)) {
+			error("\"%s\" exists but is not a directory", dst);
 			return -1;
+		}
 	}
 
 	if ((dirp = opendir(src)) == NULL) {
@@ -1826,6 +1882,8 @@ upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 	while (((dp = readdir(dirp)) != NULL) && !interrupted) {
 		if (dp->d_ino == 0)
 			continue;
+		free(new_dst);
+		free(new_src);
 		filename = dp->d_name;
 		new_dst = path_append(dst, filename);
 		new_src = path_append(src, filename);
@@ -1852,9 +1910,9 @@ upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 			}
 		} else
 			logit("%s: not a regular file\n", filename);
-		free(new_dst);
-		free(new_src);
 	}
+	free(new_dst);
+	free(new_src);
 
 	do_setstat(conn, dst, &a);
 

@@ -1,4 +1,4 @@
-/* $OpenBSD: xmalloc.c,v 1.32 2015/04/24 01:36:01 deraadt Exp $ */
+/* $OpenBSD: xmalloc.c,v 1.34 2017/05/31 09:15:42 deraadt Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -25,6 +25,16 @@
 
 #include "xmalloc.h"
 #include "log.h"
+
+void
+ssh_malloc_init(void)
+{
+#if defined(__OpenBSD__)
+	extern char *malloc_options;
+
+	malloc_options = "S";
+#endif /* __OpenBSD__ */
+}
 
 void *
 xmalloc(size_t size)
@@ -63,6 +73,18 @@ xreallocarray(void *ptr, size_t nmemb, size_t size)
 	new_ptr = reallocarray(ptr, nmemb, size);
 	if (new_ptr == NULL)
 		fatal("xreallocarray: out of memory (%zu elements of %zu bytes)",
+		    nmemb, size);
+	return new_ptr;
+}
+
+void *
+xrecallocarray(void *ptr, size_t onmemb, size_t nmemb, size_t size)
+{
+	void *new_ptr;
+
+	new_ptr = recallocarray(ptr, onmemb, nmemb, size);
+	if (new_ptr == NULL)
+		fatal("xrecallocarray: out of memory (%zu elements of %zu bytes)",
 		    nmemb, size);
 	return new_ptr;
 }
